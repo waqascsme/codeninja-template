@@ -11,16 +11,64 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Detect toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set +e
+          JAVA=17
+          GRADLE_OUT=8.7
+          AGP=""
+          GRADLE_VER=""
+
+          AGP=$(grep -rhoE "com\.android\.tools\.build:gradle: *[\"']?[0-9]+\.[0-9]+(\.[0-9]+)?" --include='*.gradle' --include='*.gradle.kts' --include='*.toml' . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
+
+          if [ -z "$AGP" ]; then
+            AGP=$(grep -rhoiE "^[[:space:]]*(agp|androidGradlePlugin|androidGradle|android)[[:space:]]*=[[:space:]]*\"[0-9]+\.[0-9]+(\.[0-9]+)?\"" --include='*.toml' . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
+          fi
+
+          if [ -z "$AGP" ]; then
+            AGP=$(grep -rh "com\.android\.application\|com\.android\.library\|com\.android\.dynamic-feature" --include='*.gradle' --include='*.gradle.kts' . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
+          fi
+
+          if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            GRADLE_VER=$(grep -oE "gradle-[0-9]+(\.[0-9]+)+" gradle/wrapper/gradle-wrapper.properties | head -1 | cut -d- -f2)
+          fi
+
+          if [ -n "$AGP" ]; then
+            AGP_MAJOR=$(echo "$AGP" | cut -d. -f1)
+            if [ "$AGP_MAJOR" -lt 8 ] 2>/dev/null; then
+              JAVA=11
+              GRADLE_OUT=7.6.4
+            fi
+          elif [ -n "$GRADLE_VER" ]; then
+            G_MAJOR=$(echo "$GRADLE_VER" | cut -d. -f1)
+            G_MINOR=$(echo "$GRADLE_VER" | cut -d. -f2)
+            [ -z "$G_MINOR" ] && G_MINOR=0
+            if [ "$G_MAJOR" -lt 7 ] 2>/dev/null; then
+              JAVA=11
+              GRADLE_OUT=7.6.4
+            fi
+            if [ "$G_MAJOR" -eq 7 ] 2>/dev/null && [ "$G_MINOR" -lt 3 ] 2>/dev/null; then
+              JAVA=11
+              GRADLE_OUT=7.6.4
+            fi
+          fi
+
+          echo "java=$JAVA" >> "$GITHUB_OUTPUT"
+          echo "gradle=$GRADLE_OUT" >> "$GITHUB_OUTPUT"
+          echo "Detected AGP=$AGP Gradle=$GRADLE_VER -> JDK $JAVA, Gradle $GRADLE_OUT"
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: ${{ steps.toolchain.outputs.java }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.7"
+          gradle-version: ${{ steps.toolchain.outputs.gradle }}
 
       - name: Build debug APK
         run: |
