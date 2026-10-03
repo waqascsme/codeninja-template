@@ -44,9 +44,14 @@ jobs:
 
           if [ -n "$AGP" ]; then
             AGP_MAJOR=$(echo "$AGP" | cut -d. -f1)
+            AGP_MINOR=$(echo "$AGP" | cut -d. -f2)
+            [ -z "$AGP_MINOR" ] && AGP_MINOR=0
             if [ "$AGP_MAJOR" -lt 8 ] 2>/dev/null; then
               JAVA=11
               GRADLE_OUT=7.6.4
+            else
+              if [ "$AGP_MAJOR" -ge 9 ] 2>/dev/null; then GRADLE_OUT=8.11.1; fi
+              if [ "$AGP_MAJOR" -eq 8 ] 2>/dev/null && [ "$AGP_MINOR" -ge 7 ] 2>/dev/null; then GRADLE_OUT=8.11.1; fi
             fi
           elif [ -n "$GRADLE_VER" ]; then
             G_MAJOR=$(echo "$GRADLE_VER" | cut -d. -f1)
@@ -62,9 +67,17 @@ jobs:
             fi
           fi
 
+          EXPLICIT=$(grep -rhoE "jvmToolchain[[:space:]]*\([[:space:]]*[0-9]+|JavaLanguageVersion\.of[[:space:]]*\([[:space:]]*[0-9]+|JavaVersion\.VERSION_[0-9]+|jvmTarget[[:space:]]*=[[:space:]]*[\"'][0-9]+|jvmTarget\.set\([[:space:]]*[\"']?[0-9]+|release[[:space:]]*=[[:space:]]*[0-9]+|release\.set\([[:space:]]*[0-9]+" --include='*.gradle' --include='*.gradle.kts' --include='*.toml' . 2>/dev/null | grep -oE "[0-9]+" | sort -rn | head -1)
+          if [ -n "$EXPLICIT" ] && [ "$EXPLICIT" -gt "$JAVA" ] 2>/dev/null; then
+            JAVA=$EXPLICIT
+          fi
+          if [ "$JAVA" -ge 21 ] 2>/dev/null && [ "$GRADLE_OUT" = "7.6.4" ]; then
+            GRADLE_OUT=8.7
+          fi
+
           echo "java=$JAVA" >> "$GITHUB_OUTPUT"
           echo "gradle=$GRADLE_OUT" >> "$GITHUB_OUTPUT"
-          echo "Detected AGP=$AGP Gradle=$GRADLE_VER -> JDK $JAVA, Gradle $GRADLE_OUT"
+          echo "Detected AGP=$AGP Gradle=$GRADLE_VER Jvm=$EXPLICIT -> JDK $JAVA, Gradle $GRADLE_OUT"
 
       - name: Set up Java
         uses: actions/setup-java@v4
