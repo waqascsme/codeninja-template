@@ -28,6 +28,13 @@ jobs:
           fi
 
           if [ -z "$AGP" ]; then
+            REF=$(grep -rh "com\.android\.tools\.build:gradle\|com\.android\.application\|com\.android\.library\|com\.android\.dynamic-feature" --include='*.toml' . 2>/dev/null | grep -o "version\.ref *= *\"[^\"]*\"" | head -1 | sed -E 's/.*"([^"]*)".*/\1/')
+            if [ -n "$REF" ]; then
+              AGP=$(grep -rhoiE "^[[:space:]]*$REF[[:space:]]*=[[:space:]]*\"[0-9]+\.[0-9]+(\.[0-9]+)?\"" --include='*.toml' . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
+            fi
+          fi
+
+          if [ -z "$AGP" ]; then
             AGP=$(grep -rh "com\.android\.application\|com\.android\.library\|com\.android\.dynamic-feature" --include='*.gradle' --include='*.gradle.kts' . 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -1)
           fi
 
