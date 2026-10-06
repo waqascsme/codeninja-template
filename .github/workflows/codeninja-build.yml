@@ -42,42 +42,61 @@ jobs:
             GRADLE_VER=$(grep -oE "gradle-[0-9]+(\.[0-9]+)+" gradle/wrapper/gradle-wrapper.properties | head -1 | cut -d- -f2)
           fi
 
+          # Floor: the oldest JVM that can still host this AGP/Gradle pair.
+          FLOOR_JAVA=$JAVA
+          FLOOR_GRADLE=$GRADLE_OUT
           if [ -n "$AGP" ]; then
             AGP_MAJOR=$(echo "$AGP" | cut -d. -f1)
             AGP_MINOR=$(echo "$AGP" | cut -d. -f2)
             [ -z "$AGP_MINOR" ] && AGP_MINOR=0
             if [ "$AGP_MAJOR" -lt 8 ] 2>/dev/null; then
-              JAVA=11
-              GRADLE_OUT=7.6.4
-            else
-              if [ "$AGP_MAJOR" -ge 9 ] 2>/dev/null; then GRADLE_OUT=8.11.1; fi
-              if [ "$AGP_MAJOR" -eq 8 ] 2>/dev/null && [ "$AGP_MINOR" -ge 7 ] 2>/dev/null; then GRADLE_OUT=8.11.1; fi
+              FLOOR_JAVA=11
+              FLOOR_GRADLE=7.6.4
             fi
+            if [ "$AGP_MAJOR" -ge 9 ] 2>/dev/null; then FLOOR_GRADLE=9.0; fi
+            if [ "$AGP_MAJOR" -eq 8 ] 2>/dev/null && [ "$AGP_MINOR" -ge 7 ] 2>/dev/null; then FLOOR_GRADLE=8.11.1; fi
           elif [ -n "$GRADLE_VER" ]; then
             G_MAJOR=$(echo "$GRADLE_VER" | cut -d. -f1)
             G_MINOR=$(echo "$GRADLE_VER" | cut -d. -f2)
             [ -z "$G_MINOR" ] && G_MINOR=0
             if [ "$G_MAJOR" -lt 7 ] 2>/dev/null; then
-              JAVA=11
-              GRADLE_OUT=7.6.4
+              FLOOR_JAVA=11
+              FLOOR_GRADLE=7.6.4
             fi
             if [ "$G_MAJOR" -eq 7 ] 2>/dev/null && [ "$G_MINOR" -lt 3 ] 2>/dev/null; then
-              JAVA=11
-              GRADLE_OUT=7.6.4
+              FLOOR_JAVA=11
+              FLOOR_GRADLE=7.6.4
             fi
           fi
 
-          EXPLICIT=$(grep -rhoE "jvmToolchain[[:space:]]*\([[:space:]]*[0-9]+|JavaLanguageVersion\.of[[:space:]]*\([[:space:]]*[0-9]+|JavaVersion\.VERSION_[0-9]+|jvmTarget[[:space:]]*=[[:space:]]*[\"'][0-9]+|jvmTarget\.set\([[:space:]]*[\"']?[0-9]+|release[[:space:]]*=[[:space:]]*[0-9]+|release\.set\([[:space:]]*[0-9]+" --include='*.gradle' --include='*.gradle.kts' --include='*.toml' . 2>/dev/null | grep -oE "[0-9]+" | sort -rn | head -1)
+          # Read only what the project *declares*, i.e. an assignment. A bare
+          # "JavaVersion.VERSION_22" inside "if (JavaVersion.current() >= ...)"
+          # is a runtime condition, not a requirement; matching it once chose
+          # JDK 22 for a project targeting 21 and tripped that project's own
+          # version guard into adding a javac flag that only exists on 23+.
+          # "VERSION_1_8" yields both 1 and 8 and the max below picks 8.
+          EXPLICIT=$(grep -rhoE "jvmToolchain[[:space:]]*\([[:space:]]*[0-9]+|JavaLanguageVersion\.of[[:space:]]*\([[:space:]]*[0-9]+|(source|target)Compatibility[[:space:]]*=?[[:space:]]*JavaVersion\.VERSION_[0-9]+(_[0-9]+)?|jvmTarget[[:space:]]*=[[:space:]]*[\"'][0-9]+|jvmTarget\.set\([[:space:]]*[\"']?[0-9]+|(^|[^[:alnum:]_])release[[:space:]]*=[[:space:]]*[0-9]+|release\.set\([[:space:]]*[0-9]+" --include='*.gradle' --include='*.gradle.kts' --include='*.toml' . 2>/dev/null | grep -oE "[0-9]+" | sort -rn | head -1)
+
+          JAVA=$FLOOR_JAVA
           if [ -n "$EXPLICIT" ] && [ "$EXPLICIT" -gt "$JAVA" ] 2>/dev/null; then
             JAVA=$EXPLICIT
           fi
-          if [ "$JAVA" -ge 21 ] 2>/dev/null && [ "$GRADLE_OUT" = "7.6.4" ]; then
+
+          # The wrapper is the project's own Gradle declaration, so prefer it:
+          # it is what ./gradlew runs and it is what the "gradle" fallback on
+          # PATH should agree with. Only a wrapperless repo uses the floor.
+          if [ -n "$GRADLE_VER" ]; then
+            GRADLE_OUT=$GRADLE_VER
+          else
+            GRADLE_OUT=$FLOOR_GRADLE
+          fi
+          if [ "$JAVA" -ge 21 ] 2>/dev/null && [ "$(echo "$GRADLE_OUT" | cut -d. -f1)" -lt 8 ] 2>/dev/null; then
             GRADLE_OUT=8.7
           fi
 
           echo "java=$JAVA" >> "$GITHUB_OUTPUT"
           echo "gradle=$GRADLE_OUT" >> "$GITHUB_OUTPUT"
-          echo "Detected AGP=$AGP Gradle=$GRADLE_VER Jvm=$EXPLICIT -> JDK $JAVA, Gradle $GRADLE_OUT"
+          echo "Detected AGP=$AGP Gradle=$GRADLE_VER Declared=$EXPLICIT floor=$FLOOR_JAVA -> JDK $JAVA, Gradle $GRADLE_OUT"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -91,12 +110,55 @@ jobs:
           gradle-version: ${{ steps.toolchain.outputs.gradle }}
 
       - name: Build debug APK
+        id: build
+        continue-on-error: true
+        shell: bash
         run: |
+          set -o pipefail
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
-            ./gradlew assembleDebug --no-daemon --stacktrace
+            ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
           else
-            gradle assembleDebug --no-daemon --stacktrace
+            gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+          fi
+
+      # A failure that is really "the JVM we picked was wrong" gets one attempt
+      # on a newer JDK. Such requirements never appear in the source tree — a
+      # plugin declares them in its published metadata, a build script guards on
+      # JavaVersion.current() — so they only surface once the build runs.
+      # Anything else fails here, unchanged.
+      - name: Check build failure
+        id: check
+        if: steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          CUR=${{ steps.toolchain.outputs.java }}
+          if [ ! -f build.log ] || [ "$CUR" -ge 25 ] || ! grep -qE "requires at least JVM runtime version|invalid flag:|invalid source release|Unsupported class file major version|Could not determine Java version|does not support (running on )?Java|This build uses a Java [0-9]+ JVM" build.log; then
+            echo "retry=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ "$CUR" -lt 21 ]; then NEXT=21; elif [ "$CUR" -lt 23 ]; then NEXT=23; else NEXT=25; fi
+          echo "retry=true" >> "$GITHUB_OUTPUT"
+          echo "java=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "JVM-shaped failure on JDK $CUR -> retrying on JDK $NEXT"
+
+      - name: Set up Java (retry)
+        if: steps.check.outputs.retry == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.check.outputs.java }}
+
+      - name: Build debug APK (retry)
+        if: steps.check.outputs.retry == 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee -a build.log
+          else
+            gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee -a build.log
           fi
 
       - name: Upload APK
