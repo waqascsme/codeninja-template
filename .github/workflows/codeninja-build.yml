@@ -113,6 +113,44 @@ jobs:
             echo "Pinned Flutter $FLUTTER_VER"
           fi
 
+          # A project may declare a release signingConfig that expects a keystore it does
+          # not ship — key.properties is in every Flutter app's .gitignore. The source
+          # compiles fine and then the build dies at :app:packageRelease, which would
+          # break the "zero setup: it just builds" promise. Fall back to the debug key,
+          # but only when no keystore is genuinely available: a repo that supplies one
+          # keeps its own signing config untouched.
+          HAS_KEYSTORE=""
+          for KP in key.properties keystore.properties android/key.properties android/keystore.properties; do
+            if [ -f "$KP" ]; then
+              HAS_KEYSTORE=1
+            fi
+          done
+          if [ -n "$ANDROID_KEYSTORE_PATH" ] || [ -n "$ANDROID_KEY_PATH" ]; then
+            HAS_KEYSTORE=1
+          fi
+
+          SIGNING_NOTE=""
+          if [ -z "$HAS_KEYSTORE" ]; then
+            for SGRADLE in android/app/build.gradle android/app/build.gradle.kts app/build.gradle app/build.gradle.kts; do
+              if [ -f "$SGRADLE" ] && grep -q -e 'signingConfigs\.release' -e 'getByName("release")' -e "getByName('release')" "$SGRADLE"; then
+                # /signingConfig/ keeps the edit on the one line that assigns it, so an
+                # unrelated getByName("release") elsewhere in the file is left alone.
+                sed -i.bak \
+                  -e '/signingConfig/s/signingConfig[[:space:]][[:space:]]*signingConfigs\.release/signingConfig signingConfigs.debug/g' \
+                  -e '/signingConfig/s/getByName("release")/getByName("debug")/g' \
+                  -e "/signingConfig/s/getByName('release')/getByName('debug')/g" \
+                  "$SGRADLE"
+                if ! cmp -s "$SGRADLE" "$SGRADLE.bak"; then
+                  SIGNING_NOTE=$SGRADLE
+                fi
+                rm -f "$SGRADLE.bak"
+              fi
+            done
+          fi
+          if [ -n "$SIGNING_NOTE" ]; then
+            echo "No keystore found; $SIGNING_NOTE release build will be debug-signed (add android/key.properties to sign properly)"
+          fi
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
