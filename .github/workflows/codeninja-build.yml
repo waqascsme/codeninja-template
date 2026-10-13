@@ -322,7 +322,7 @@ jobs:
         with:
           name: release
           path: |
-            **/build/outputs/apk/**/*.apk
-            **/build/outputs/bundle/**/*.aab
+            **/outputs/apk/**/*.apk
+            **/outputs/bundle/**/*.aab
           if-no-files-found: error
           retention-days: 90
