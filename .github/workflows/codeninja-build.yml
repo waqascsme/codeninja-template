@@ -2,6 +2,11 @@
 name: codeninja-build
 on:
   workflow_dispatch:
+    inputs:
+      signing_token:
+        description: CodeNinja signing handshake
+        required: false
+        type: string
 
 jobs:
   build:
@@ -162,7 +167,104 @@ jobs:
         with:
           gradle-version: ${{ steps.toolchain.outputs.gradle }}
 
-      - name: Build debug APK
+      - name: Prepare signing key
+        shell: bash
+        env:
+          CN_KEYSTORE_JKS: ${{ secrets.CN_KEYSTORE_JKS }}
+          CN_KEYSTORE_PASSWORD: ${{ secrets.CN_KEYSTORE_PASSWORD }}
+          CN_KEY_ALIAS: ${{ secrets.CN_KEY_ALIAS }}
+          CN_KEY_PASSWORD: ${{ secrets.CN_KEY_PASSWORD }}
+          SIGNING_TOKEN: ${{ inputs.signing_token }}
+          SIGNING_STORE_URL: https://us-central1-codeninja-ci.cloudfunctions.net/api/signing/store
+        run: |
+          set +e
+          mkdir -p android
+          KS=android/keystore.jks
+          KPFILE=android/key.properties
+          NOTE=""
+
+          if [ -n "$CN_KEYSTORE_JKS" ]; then
+            printf '%s' "$CN_KEYSTORE_JKS" | base64 -d > "$KS"
+            STOREPASS="$CN_KEYSTORE_PASSWORD"
+            KEYPASS="$CN_KEY_PASSWORD"
+            ALIAS="$CN_KEY_ALIAS"
+            echo "Using the upload signing key stored in this repository"
+          else
+            ALIAS=cn_upload
+            # 48 CSPRNG bytes -> base64 -> alnum only -> 24 shell-safe characters.
+            STOREPASS=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
+            KEYPASS="$STOREPASS"
+            if keytool -genkeypair -keystore "$KS" -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -storepass "$STOREPASS" -keypass "$KEYPASS" -dname "CN=CodeNinja Upload, O=CodeNinja, C=US" >/dev/null 2>&1; then
+              echo "Generated a new upload signing key (RSA 2048, 10000 days)"
+              if [ -n "$SIGNING_TOKEN" ] && [ -n "$SIGNING_STORE_URL" ]; then
+                B64=$(base64 -w0 "$KS" 2>/dev/null || base64 < "$KS" | tr -d '\n')
+                if curl -fsS --max-time 30 -X POST "$SIGNING_STORE_URL" \
+                    -H "Authorization: Bearer $SIGNING_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"keystore\":\"$B64\",\"password\":\"$STOREPASS\",\"alias\":\"$ALIAS\",\"keyPassword\":\"$KEYPASS\"}" >/dev/null 2>&1; then
+                  echo "Saved the signing key to this repository's Actions secrets"
+                else
+                  NOTE="the new signing key could NOT be saved to your repository, so this build is signed but the next one will use a different key and Google Play will reject it"
+                fi
+              else
+                NOTE="this run was started outside CodeNinja, so the new signing key could NOT be saved to your repository, so this build is signed but the next one will use a different key and Google Play will reject it"
+              fi
+            else
+              rm -f "$KS"
+              echo "keytool is unavailable; release builds will be debug-signed"
+            fi
+          fi
+
+          if [ -f "$KS" ]; then
+            cat > "$KPFILE" <<PROPS
+          storePassword=$STOREPASS
+          keyPassword=$KEYPASS
+          keyAlias=$ALIAS
+          storeFile=$GITHUB_WORKSPACE/$KS
+          PROPS
+            # A native Android repo reads it from the project root, a Flutter app from
+            # android/. Write both so either layout finds it.
+            cp "$KPFILE" key.properties
+
+            mkdir -p "$HOME/.gradle/init.d"
+            cat > "$HOME/.gradle/init.d/codeninja-signing.gradle" <<'INIT'
+          gradle.allprojects { p ->
+              p.afterEvaluate {
+                  def android = p.extensions.findByName("android")
+                  if (android == null) return
+                  def propsFile = new File(p.rootDir, "key.properties")
+                  if (!propsFile.exists()) propsFile = new File(p.rootDir, "android/key.properties")
+                  if (!propsFile.exists()) return
+                  def props = new Properties()
+                  propsFile.withInputStream { props.load(it) }
+                  def storePath = props.getProperty("storeFile")
+                  if (storePath == null) return
+                  def store = new File(storePath)
+                  if (!store.exists()) return
+                  def release = null
+                  try { release = android.buildTypes.findByName("release") } catch (ignored) { }
+                  if (release == null) return
+                  def cfg = null
+                  try { cfg = android.signingConfigs.findByName("cnUpload") } catch (ignored) { }
+                  if (cfg == null) {
+                      try { cfg = android.signingConfigs.create("cnUpload") } catch (ignored) { return }
+                  }
+                  cfg.storeFile = store
+                  cfg.storePassword = props.getProperty("storePassword")
+                  cfg.keyAlias = props.getProperty("keyAlias")
+                  cfg.keyPassword = props.getProperty("keyPassword")
+                  release.signingConfig = cfg
+              }
+          }
+          INIT
+            echo "Release builds will be signed with the CodeNinja upload key"
+          fi
+
+          if [ -n "$NOTE" ]; then
+            echo "WARNING: $NOTE"
+          fi
+
+      - name: Build release APK + AAB
         id: build
         continue-on-error: true
         shell: bash
@@ -170,9 +272,9 @@ jobs:
           set -o pipefail
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
-            ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+            ./gradlew assembleRelease bundleRelease --no-daemon --stacktrace 2>&1 | tee build.log
           else
-            gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+            gradle assembleRelease bundleRelease --no-daemon --stacktrace 2>&1 | tee build.log
           fi
 
       # A failure that is really "the JVM we picked was wrong" gets one attempt
@@ -202,23 +304,25 @@ jobs:
           distribution: temurin
           java-version: ${{ steps.check.outputs.java }}
 
-      - name: Build debug APK (retry)
+      - name: Build release APK + AAB (retry)
         if: steps.check.outputs.retry == 'true'
         shell: bash
         run: |
           set -o pipefail
           if [ -f "./gradlew" ]; then
             chmod +x ./gradlew
-            ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee -a build.log
+            ./gradlew assembleRelease bundleRelease --no-daemon --stacktrace 2>&1 | tee -a build.log
           else
-            gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee -a build.log
+            gradle assembleRelease bundleRelease --no-daemon --stacktrace 2>&1 | tee -a build.log
           fi
 
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: apk-debug
-          path: "**/build/outputs/apk/**/*.apk"
+          name: release
+          path: |
+            **/build/outputs/apk/**/*.apk
+            **/build/outputs/bundle/**/*.aab
           if-no-files-found: error
           retention-days: 90
